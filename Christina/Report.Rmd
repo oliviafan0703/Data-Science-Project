@@ -1,0 +1,589 @@
+---
+title: "Predicting Movie Box Office and Virtual Stock Market Price"
+author: \normalsize Olivia Fan
+format: pdf
+editor: visual
+execute:
+  echo = FALSE
+  show_col_types = FALSE
+  include = FALSE
+bibliography: references.bib
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE) 
+```
+
+```{r check-packages}
+packages <- c('tidyverse','kableExtra', 'GGally', 'patchwork', 'forecast','tsbox','tseries','vars')
+install.packages(setdiff(packages, rownames(installed.packages())))
+```
+
+```{r load packages, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(GGally)
+library(patchwork)
+library(forecast)
+library(tsbox)
+library(tseries)
+library(vars)
+select <- dplyr::select
+```
+
+```{r readdata, show_col_types = FALSE}
+boxofficemojo_daily<- read_csv("../../archive/christina/boxofficemojo_daily_boxoffice.csv", show_col_types = FALSE)
+boxofficemojo_releases<- read_csv("../../archive/christina/boxofficemojo_releases.csv", show_col_types = FALSE)
+hsx_master<- read_csv("../../archive/christina/hsx_movie_master.csv", show_col_types = FALSE)
+hsx_prices<-read_csv("../../archive/christina/hsx_movie_prices.csv", show_col_types = FALSE)
+```
+
+## 1. Introduction
+
+With the advent of rapid digitization, the movie industry has encountered an explosive growth of greater than 1000 movies produced per year; consequently, it becomes a crucial concern to investors whether the movie succeeds [@7087152]. This zealous growth subsequently gives rise to virtual stock markets (VSMs), the world's largest of which, established in 1996 is the Hollywood Stock Exchange where unlimited number of consumers can trade thousands of entertainment securities [@VSM]. It comes to the fact that not only the success of the movie itself is at stake, but the inextricable relations of the movie's success with the VSM stock price could give rise to numerous hedging implications that would allow investors to make statistically informed decisions.
+
+While extensive literature has constructed models predicting movie box office, the assessment of which in light of virtual market proves to be a fairly understudied domain recently. Older studies have found that despite arbitrage opportunities in VSMs, the predictive power of HSX is quite high [@VSM]. Within the movie box office models, a considerate amount of work relies on methods that lack interpretability, such as multi-layer back propogation neural network and ensemble learning [@ensemble]. Researchers [@7087152] point out that accuracy can be improved by incorporating social factors on various online platforms, in addition to classical intrinsic factors of the movie itself. Therefore, this study aims to gauge insights into significant predictors of this multi-layered relationship with recent data (\~2020) via statistical methods with greater interpretability such as ARIMA, Baysian Model Averaging and decision tree.
+
+### Study Design
+
+The aim of this multifaceted study is three-fold, which contains three inextricably intertwined complex objectives. First, we would like to analyze factors that predict movie box office. Secondly, we would like to analyze factors that predict virtual market stock prices. Finally, we would also like to assess whether virtual markets are efficient predictors of new product success, with manifestation in box office. On top of this hierarchy of research questions, the nature of this time series data set lends itself to diverse methods such as the ARIMA (autoregressive integrated moving average) model, exponential smoothing, etc. The two sets of predictor variables of interest are (1) movie budget, genre, distributor, release date, number of theaters, MPAA rating, (2) trading volume, total volume held long, total volume held short, and IPO date. The response variables are domestic, international and worldwide box office, and stock price of the 9380 movies.
+
+## 2. Data & Data Processing
+
+The data in this data set were scraped from two websites [@data]: (1) Hollywood Stock Exchange (HSX.com), the world's leading virtual entertainment market which provides information on movie stock prices, (2) BoxOfficeMojo.com which tracks box-office revenue in a systematic way and provides the information on movie box office. The former HSX data source contains 325,640 daily domestic box office results (1995-2020) which includes the number of theaters exhibiting the movie release on this date and identifier of movie release; it also contains 16,968 movie releases, its identifier, budget, distributor name, domestic gross to date, international gross to date, worldwide gross to date, release date, widest release, genre and MPAA rating. The latter BoxOfficeMojo data source contains master movie data on 9,380 movies from HSX.com., i.e. genre, stock IPO date, release date, delist date, MPAA rating, number of theaters and distributor; it also contains 12,677,219 hourly movie stock prices (1997-2020) from HSX.com, along with total number of shares held short, shares held long and trading volume at the time stamp.
+
+```{r, echo=FALSE}
+### FUNCTION TO convert running time into minutes:
+char_to_minutes <- function(time_string){ 
+    time_components <- strsplit(time_string, " ")[[1]]
+    hours <- as.integer(time_components[1])
+    minutes <- as.integer(gsub("min", "", time_components[3])) # remove "min" from the string
+    if (length(time_components) == 4) {
+      total_minutes <- hours * 60 + minutes
+    } else {
+      total_minutes <- as.integer(time_components[1])
+    }
+    total_minutes
+}
+
+boxofficemojo_releases<-boxofficemojo_releases%>%select(-old_bomojo_id,-hsx_symbol,-imdb_title_bomojo_url,-domestic_opening)%>%
+  rowwise()%>%
+  mutate(widest_release_num=extract_numeric(widest_release))%>%
+  select(-widest_release)%>%
+  mutate(runtime_minutes=char_to_minutes(running_time))%>%
+  select(-running_time)
+
+boxofficemojo_releases_by_genre<-boxofficemojo_releases%>%
+  separate_rows(genres, sep = ",\\s*")%>%
+  mutate(Genre=gsub("[^[:alpha:]]", "", genres))%>%
+  select(-genres)%>%
+  filter(budget!=0)
+hsx_master<-hsx_master%>%select(-phase,-release_pattern)
+```
+
+In data processing, we first filtered out extraneous information irrelevant to our analysis, such as the old BoxOfficeMojo id, the BoxOfficeMojo symbol, synopsis of the movie and the BoxOfficeMojo url. To facilitate further analysis, we transformed the dates from characters to the correct format. Because many movies are attributed multiple genres, in order to analyze the impact of genre on the response, we separated the list of genres into separate rows so that each contains one category Then we filtered out missing information such as phase (with over 96% missing) and release pattern (98% missing) in HSX data, as well as domestic opening (every row contains the identical 0) in BoxOfficeMojo data.
+
+## 3. Exploratory Data Analysis
+
+### Objective 1: Predicting Movie Box Office
+
+```{r, echo=F, warning=F, out.height  = '50%', out.width = '70%', cache=TRUE}
+df1<-boxofficemojo_releases_by_genre%>%
+  group_by(identifier)%>%
+  summarise(domestic=sum(domestic_gross), international = sum(international_gross), worldwide = sum(worldwide_gross))
+
+df1<-df1%>%left_join(boxofficemojo_releases_by_genre, by=c('identifier'='identifier'))%>%
+  select(domestic,international,worldwide, budget, Genre)%>%
+  na.omit()%>%
+  filter(Genre=='Action'|Genre=='Adventure'|Genre=='Animation'|Genre=='Comedy'|Genre=='Thriller'|Genre=='Drama'|Genre=='Fantasy'|Genre=='Horror'|Genre=='Musical'|Genre=='Documentary'|Genre=='Romance'|Genre=='SciFi')
+
+df1<-df1%>%pivot_longer(-c(budget, Genre), names_to = "Region", values_to = "Sales")
+
+# Plot the sales data
+ggplot(df1, aes(x = log(budget), y = Sales, color = Region)) +
+  geom_point(size=0.5, fill=NA) +
+  geom_smooth(fill=NA) +
+  theme(legend.key.size = unit(0.3, "cm")) +
+  facet_wrap(~ Genre)+
+  ggtitle("Relationship between Budge and Box Office by Region across Genres") +
+  xlab("Log(Budget)") +
+  ylab("Box Office")+
+  scale_color_discrete(name = "Region", guide = guide_legend(override.aes = list(size = 1)))+
+  theme(panel.spacing.x = unit(2, "mm"))
+```
+
+We observe that the relationship between budget and box office is vastly different across genres: Action, adventure, drama and sci-fi movies have a steep slope and generally high budget spans, with outliers which have exceedingly high budget and high box office. On the other hand, genres such as horror, thriller and romance have a much flatter slope, which corresponds to the industry knowledge that certain genres are more conducive to low-budget film making than others. According to New Review of Film and Television Studies (2011), horror and thriller movies are typically associated with such framework, and our further analysis corroborates this insight. By calculating the box office to budget ratio, we found that three out of the top 4 movie in terms of this cost effectiveness are horror or thriller movies.
+
+```{r}
+genres <- c("Horror, Mystery, Thriller", "Horror, Mystery", "Biography, Dcoumentary", "Horror, Mystery, Thriller")
+
+boxofficemojo_releases_by_genre%>%mutate(ratio=worldwide_gross/budget)%>%
+  arrange(desc(ratio))%>%
+  select(title, ratio)%>%
+  unique()%>%
+  head(4)%>%
+  cbind(genres)%>%
+  kable()
+```
+
+### Objective 2. Predicting Stock Price
+
+The second objective is again two fold. We first want to predict (1) the price, and (2) the volatility of the stock in order to both gauge insights into its average performance, and assess the risk in the investment. We measure the stock price as the average over time. To measure volatility, we use the standard deviation of its prices over time to quantify the rate of fluctuations, as suggested by the Corporate Finance Institute [@volatility].
+
+```{r, echo=F, warning=F, fig.height  = 4, fig.width = 8, cache=TRUE}
+# CALCULATE AVG PRICE and VOLATILITY
+# Group the data frame by stock and calculate the average price
+average_prices <- aggregate(price ~ identifier, data = hsx_prices, mean)
+
+# Calculate the volatility of each stock
+volatility <- function(x) { sd(x) / mean(x) }
+volatilities <- tapply(hsx_prices$price, hsx_prices$identifier, volatility)
+
+# Combine the average prices and volatilities into a single data frame
+result <- data.frame(identifier = average_prices$identifier,
+                     average_price = average_prices$price,
+                     volatility = as.numeric(volatilities))
+
+df4<-result%>%inner_join(hsx_master, by=c('identifier'='identifier'))%>%
+  inner_join(boxofficemojo_releases_by_genre, by=c('title'='title'))%>%
+  select(Genre, runtime_minutes, mpaa_rating.y, theaters, distributor_name, average_price, volatility, identifier.x)
+
+p1<-ggplot(df4, aes(x=distributor_name, y=volatility)) + geom_boxplot() + coord_flip()+labs(x="Distributor", y="Volatility")+ggtitle("Volatility vs. distributors")
+
+p2<-ggplot(df4, aes(x=Genre, y=average_price))+ geom_boxplot() + coord_flip()+labs(y="Average Stock Price")+ggtitle("Average price vs. genres")
+
+p1+p2
+```
+
+We observe distributor's significant impact on volatility: As we might have expected, the stock of the "big name" production companies such as Walt Disney, Sony Pictures, Fox and Warner Brothers tend to have low volatility and tight range; Whereas, New Line Cinema has exceedingly variable volatility spanning from under 0.1 to around 0.8. Similarly we observe genre's impact on stock price: Musical and Animation tend to have the highest stock prices albeit a wide range, whereas history, sport and horror movies have consistently low average stock prices.
+
+```{r, echo=F, warning=F, out.height  = '50%', out.width = '50%', cache=TRUE}
+p_volatility<-ggplot(result, aes(x = average_price, y = volatility))+
+  geom_point(size = 0.5, color = "darkviolet")+geom_smooth(fill=NA)+labs(x = "Average Price", 
+       y = "Volatility",
+       title = "Volatility vs. Price for HSX Stocks")
+
+df2<-hsx_prices%>%
+  filter(identifier=="1031")%>%
+  select(price, shares_long, shares_short, trading_vol)
+
+
+# panel.points<-function(x,y)
+# {
+#   points(x,y,cex=0.5)
+# }
+# 
+# pairs(df2,lower.panel=panel.points)
+```
+
+### Objective 3. Relating virtual markets to product success
+
+```{r, echo=F, warning=F, out.height  = '50%', out.width = '50%', cache=TRUE}
+# Aladdin, Avengers
+movie_name<-"Avengers: Endgame"
+df_avengers<-boxofficemojo_releases%>%filter(title==movie_name)%>%
+  inner_join(boxofficemojo_daily, by=c('identifier'='identifier'))%>%
+  select(daily_domestic_gross, bo_date)
+
+stocks_avengers<-hsx_master%>%filter(title==movie_name)%>%
+  inner_join(hsx_prices, by=c('identifier'='identifier'))
+
+stocks_avengers$retrieved_at <- as.Date(stocks_avengers$retrieved_at)
+
+p3<-ggplot(data = df_avengers) +
+  geom_line(aes(x = bo_date, y = daily_domestic_gross), 
+            color = "#F8766D",
+            alpha = 0.6,
+            size = 0.6) +
+  labs(x = "Date", 
+       y = "Box Office",
+       title = "Avengers: Endgame box office") +
+  scale_x_date(date_labels = "%b-%y")+
+  theme_minimal()
+
+p4<-ggplot(data = stocks_avengers) +
+  geom_line(aes(x = as.Date(retrieved_at), y = price), 
+            color = "#09557f",
+            alpha = 0.6,
+            size = 0.6) +
+  labs(x = "Date", 
+       y = "USD per share",
+       title = "Avengers: Endgame stock price") +
+  scale_x_date(date_labels = "%b-%y")+
+  theme_minimal()
+
+
+# Aladdin, Avengers
+movie_name<-"Aladdin"
+df_avengers<-boxofficemojo_releases%>%filter(title==movie_name)%>%
+  inner_join(boxofficemojo_daily, by=c('identifier'='identifier'))%>%
+  select(daily_domestic_gross, bo_date)
+
+stocks_avengers<-hsx_master%>%filter(title==movie_name)%>%
+  inner_join(hsx_prices, by=c('identifier'='identifier'))
+
+stocks_avengers$retrieved_at <- as.Date(stocks_avengers$retrieved_at)
+
+p5<-ggplot(data = df_avengers) +
+  geom_line(aes(x = bo_date, y = daily_domestic_gross), 
+            color = "#F8766D",
+            alpha = 0.6,
+            size = 0.6) +
+  labs(x = "Date", 
+       y = "Box Office",
+       title = "Aladdin box office") +
+  scale_x_date(date_labels = "%b-%y")+
+  theme_minimal()
+
+p6<-ggplot(data = stocks_avengers) +
+  geom_line(aes(x = as.Date(retrieved_at), y = price), 
+            color = "#09557f",
+            alpha = 0.6,
+            
+            size = 0.6) +
+  labs(x = "Date", 
+       y = "USD per share",
+       title = "Aladdin stock price") +
+  scale_x_date(date_labels = "%b-%y")+
+  theme_minimal()
+
+p_volatility
+(p3+p5)/(p4+p6)
+```
+
+We observe an inverse association between average price and volatility. Comparing the time series movement of box office and stock price for movies Avenger and Aladdin, we notice that for both movies, significant movements in stock price (albeit different directions, Avenger rose in stock price while Aladdin declined) preceded significant declines in box office, hinting the predictive power of VSM on box office. One issue down the road is that the box office and the stock price come from two different websites and therefore do not have a one-to-one correspondence, leading to a portion of data missing, which could be mitigated through further web scraping or data imputation.
+
+\newpage
+
+# Statistical Analysis Plan
+
+## 4. Aims & Hypotheses
+
+**Aim 1** What are the factors that affect the fluctuations of movie box office over time? Specifically, does the daily theater count or widest release correlate more strongly with the oscillations in movie box office - in other words, does a movie achieve success through continuous rapport or does a transient success suffice? How are budget, genre, runtime and distributor associated with a movie’s box office? Do daily theater count correlate with, or wildest release?
+  
+**Aim 2**
+What are the factors that affect HSX stock average price, and volatility over the span of time?
+
+**Aim 3**
+To what extent does the HSX stock prices predict the movie box office?
+
+**Primary Hypothesis** The daily theater count correlates more strongly with daily movie box office than the widest release. While genre, and distributor have a significant effect on the box office, the budget and runtime do not have significant effect.
+
+**Secondary Hypothesis** The HSX stock average price correlates negatively with the volatility over the span of time, and HSX stock prices move synchronously with fluctuations in box office.
+
+
+## 5. Baseline Univariate Model: ARIMA
+
+To establish a baseline model for movie box office over time independent of the covariates, we first examine a Auto-Regressive Integrated Moving Average (ARIMA) model, also known as Box-Jenkins approach [@KOTU2019395]. As a combination of two models, the auto-regressive and the moving average models, the ARIMA model helps us predict the future forecast via lagged observations and an integrated moving average. We take the time series box office of the movie Deep Sea as an example, and visualize the time series data:
+
+```{r fig.cap = "Time Series Visualization for Deep Sea Box Office", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center'}
+arima_predictors<-boxofficemojo_daily%>%left_join(boxofficemojo_releases, by=c('identifier'='identifier'))%>%
+  select(bo_date, budget, daily_domestic_gross, daily_theater_count, distributor_name, widest_release_num, mpaa_rating, title,runtime_minutes)
+
+arima_predictors$distributor_name <- as.factor(arima_predictors$distributor_name)
+arima_predictors$mpaa_rating <- as.factor(arima_predictors$mpaa_rating)
+
+# showing monthly return for single stock
+# arima_predictors%>%group_by(title)%>%count()%>%arrange(desc(n))
+deep_sea_bo<-arima_predictors%>%filter(title=="Deep Sea")
+
+ggplot(deep_sea_bo, aes(bo_date, daily_domestic_gross)) + geom_line(color = "blue", size=0.1)+
+  labs(x="Date", title="Daily Domestic Gross Box Office", y="Daily Domestic Gross Box Office")
+```
+
+In order to perform any successive modeling, by model assumption, requires data to be stationary. That is, the mean, variance, and covariance of the series should be constant with respect to time, and there should not be white noise. Therefore, we take the difference between the log value of the daily domestic gross box office to stationarize the data, and demonstrate later through the Dickey Fuller Test that the data meets model assumptions (in the section below). By the same token, we can stationarize the HSX stock price data before fitting ARIMA to forecast future prices and perform the model assessment, diagnostics and sensitivity analysis in the following sections.
+
+For part two, We take the time series stock price of the identifier "1031" as an example, and visualize the time series data:
+
+```{r fig.cap = "Time Series Visualization for Identifier 1031 Stock Price", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center'}
+arima_predictors2<-hsx_prices%>%left_join(hsx_master, by=c('identifier'='identifier'))%>%
+  select(retrieved_at, identifier, price, shares_long, shares_short, trading_vol, domestic_gross)
+
+#arima_predictors2$distributor_name <- as.factor(arima_predictors$distributor_name)
+#arima_predictors2$mpaa_rating <- as.factor(arima_predictors$mpaa_rating)
+
+# showing monthly return for single stock
+# arima_predictors%>%group_by(title)%>%count()%>%arrange(desc(n))
+strock_price_date<-arima_predictors2%>%filter(!is.na(retrieved_at))
+strock_price_date_17BRD<-arima_predictors2%>%filter(identifier == '1031')
+
+ggplot(strock_price_date_17BRD, aes(as.Date(retrieved_at), price)) + geom_line(color = "blue")+
+  labs(x="Date", title="Stock Price", y="Stock Price")
+
+```
+
+### 5.5. ARIMA: Model Assumptions, Sensitivity Analysis & Validation
+
+#### 5.5.1 Model Assumptions 
+
+
+#### 5.5.1.1 Stationary: Dickey-Fuller test
+
+We conduct the Dickey-Fuller test to assess the stationary principle: The Dickey-Fuller test returns a p-value of 0.01, resulting in the rejection of the null hypothesis and accepting the alternate, that the data is stationary.
+
+```{r eval=FALSE}
+adf.test(diff(log(deep_sea_bo$daily_domestic_gross)), alternative="stationary", k=0)
+```
+
+```{r eval=FALSE}
+adf.test(diff(log(strock_price_date_17BRD$price)), alternative="stationary", k=0)
+```
+
+By by stationary it means that the properties of the series doesn’t depend on the time when it is captured. A white noise series and series with cyclic behavior can also be considered as stationary series.
+
+#### 5.5.1.2 Univariate
+
+We assess box office as the univariate response variable, which aligns with ARIMA's assumptions that data should be univariate, since ARIMA works on a single variable.
+
+We assess stock price as the univariate response variable, which aligns with ARIMA's assumptions that data should be univariate, since ARIMA works on a single variable.
+
+#### 5.5.2 Sensitivity Analysis: ACF/PACF
+
+There are primarily two hyperparameters in the model that we can tune to perform sensitivity analysis, MA (moving-average) and AR (auto-gression) coefficients. The ACF (Auto-Correlation Function) gives us values of any auto-correlation with its lagged values which will help us determine the number of MA coefficients in our ARIMA model, while the PACF (Partial Auto-Correlation Function) finds correlation of the residuals with the next lag value which helps us identify the number of AR coefficients in our ARIMA model. In the ACF graph below, the curve drops significantly after the first lag, which indicates a moving average component of MA(1). We can tune the MA and AR coefficients to achieve sensitivity analysis.
+
+The standard ARIMA models expect as input parameters 3 arguments, p which standards for the number of lag observations, d which is the degree of differencing, as well as q which is the size of the moving average window. This study will tune the parameters via cross validation, as well as sensitivity analysis.
+
+```{r fig.cap = "ACF and PACF for the Deep Sea Box Office Model", out.width= "70%", fig.width = "70%", cache=TRUE, fig.align='center'}
+tsdisplay(diff(log(deep_sea_bo$daily_domestic_gross)))
+```
+
+```{r fig.cap = "ACF and PACF for the Stock Price Model", out.width= "70%", fig.width = "70%", cache=TRUE, fig.align='center'}
+tsdisplay(diff(log(strock_price_date_17BRD$price)))
+```
+
+Additionally, the study also aims to perform sensitivity analysis based on seasonality, which compares the robustness of the model over the seasonal span.
+
+\newpage
+
+#### 5.5.3 Preliminary Results & Validation
+
+```{r fig.cap = "Training Fit for ARIMA Model", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center', message=FALSE, echo=FALSE}
+# plot(diff(log(deep_sea_bo$daily_domestic_gross)),type='l', main='log returns plot')
+
+# acf(diff(log(deep_sea_bo$daily_domestic_gross)))
+# pacf(diff(log(deep_sea_bo$daily_domestic_gross)))
+
+# FIT MODEL:
+fit <- arima(diff(log(deep_sea_bo$daily_domestic_gross)), c(5,0,2))
+
+# fitARIMA <- auto.arima(diff(log(deep_sea_bo$daily_domestic_gross)), trace=TRUE)
+
+plot(as.ts(diff(log(deep_sea_bo$daily_domestic_gross))) )
+lines(fitted(fit), col="red")
+```
+
+```{r fig.cap = "Training Fit for ARIMA Model", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center', message=FALSE, echo=FALSE}
+# plot(diff(log(deep_sea_bo$daily_domestic_gross)),type='l', main='log returns plot')
+
+# acf(diff(log(deep_sea_bo$daily_domestic_gross)))
+# pacf(diff(log(deep_sea_bo$daily_domestic_gross)))
+
+# FIT MODEL:
+fit <- arima(diff(log(strock_price_date_17BRD$price)), c(5,0,2))
+
+# fitARIMA <- auto.arima(diff(log(deep_sea_bo$daily_domestic_gross)), trace=TRUE)
+
+plot(as.ts(diff(log(strock_price_date_17BRD$price))) )
+lines(fitted(fit), col="red")
+```
+
+
+As preliminary results, we obtained a with p (AR coefficient) of 5, d (Integrated value) of 0, and q (MA) value of 2 which obtains an AIC value of 759.91, and BIC value of 800.03. The graph above demonstrates that the model is a close fit to the training data. Splitting past data into a training set (pseudo future data), we can examine performance on this pseudo future data to achieve cross validation.
+
+XXXXXXXXXXX
+
+#### 5.5.4 Model Diagnostics
+
+```{r fig.cap = "Diagnostic Plot for ARIMA Model", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center'}
+plot(diff(log(deep_sea_bo$daily_domestic_gross)),type='l', main='log returns plot')
+
+acf(diff(log(deep_sea_bo$daily_domestic_gross)))
+pacf(diff(log(deep_sea_bo$daily_domestic_gross)))
+# 
+ (fit <- arima(diff(log(deep_sea_bo$daily_domestic_gross)), c(3, 0, 1)))
+# 
+ fitARIMA <- auto.arima(diff(log(deep_sea_bo$daily_domestic_gross)), trace=TRUE)
+# 
+plot(as.ts(diff(log(deep_sea_bo$daily_domestic_gross))) )
+lines(fitted(fitARIMA), col="red")
+# 
+# ## FUTURE
+# futurVal <- forecast(fitARIMA,h=5, level=c(99)) #confidence level 99%
+# plot(forecast(futurVal))
+# # 5 predicted values
+# futurVal$mean
+# 
+# checkresiduals(fitARIMA)
+
+autoplot(fitARIMA)
+```
+
+Part two for stock price:
+
+
+```{r fig.cap = "Diagnostic Plot for ARIMA Model for stock price", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center'}
+
+plot(diff(log(strock_price_date_17BRD$price)),type='l', main='log returns plot')
+
+acf(diff(log(strock_price_date_17BRD$price)))
+pacf(diff(log(strock_price_date_17BRD$price)))
+# 
+ (fit <- arima(diff(log(strock_price_date_17BRD$price)), c(3, 0, 1)))
+# 
+ fitARIMA <- auto.arima(diff(log(strock_price_date_17BRD$price)), trace=TRUE)
+# 
+plot(as.ts(diff(log(strock_price_date_17BRD$price))) )
+lines(fitted(fitARIMA), col="red")
+# 
+# ## FUTURE
+ futurVal <- forecast(fitARIMA,h=5, level=c(99)) #confidence level 99%
+ plot(forecast(futurVal))
+# # 5 predicted values
+ futurVal$mean
+# 
+ checkresiduals(fitARIMA)
+
+autoplot(fitARIMA)
+```
+Plotting the characteristic roots for the model fitted, we see that they are all inside the unit circle, as we would expect because R ensures the fitted model is both stationary and invertible. 
+
+## 6. Multivariate Model: Vector Autoregression (VAR)
+
+While the baseline ARIMA model gauges insights into the changes into the fluctuations of the box office over the span of time in and of itself, since we are essentially interested in the the factors that predict the box office or stock price, we resort to the VAR (Vector Autoregression) model which is essentially a generalization of the univariate autoregressive ARIMA model. A VAR model is a type of multivariate time series model that can capture the dynamic interactions between multiple time series variables via the assumption that each variable is a function of its own past values as well as the past values of other variables in the system [@VAR]. For movie box office, we are primarily interested in genre, distributor, MPAA rating, budget, daily theater count, widest release and runtime which we plan to include in the model. For the former three categorical variables, we plan to use one-hot encoding to convert them to factor levels. Taking the box office data of the movie Titanic as an example, we explore the time series visualization of the quantitative variables below:
+
+```{r fig.cap = "Time Series Plots of Quantitative Variables for Titanic", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center'}
+titanic<-arima_predictors%>%filter(title=="Titanic")
+
+daily_domestic_gross <- ts(titanic$daily_domestic_gross, start = c(1995,1,1), frequency = 365)
+daily_theater_count <- ts(titanic$daily_theater_count, start = c(1995,1,1), frequency = 365)
+widest_release_num <- ts(titanic$widest_release_num, start = c(1995,1,1), frequency = 365)
+runtime_minutes <- ts(titanic$runtime_minutes, start = c(1995,1,1), frequency = 365)
+
+p1<-ts_ggplot(daily_domestic_gross)+labs(y="Value",x="Budget")
+p2<-ts_ggplot(daily_theater_count)+labs(y="Value",x="Daily Theater Count")
+p3<-ts_ggplot(widest_release_num)+labs(y="Value",x="Widest Release")
+p4<-ts_ggplot(runtime_minutes)+labs(y="Value",x="Runtime (min)")
+
+(p1+p2)/(p3+p4)
+```
+
+By the same token, for HSX stock prices, we are primarily interested in genre, distributor, number of shares short, number of shares long, total trading volume which we plan to include in the model. For the former categorical variables, we plan to use one-hot encoding to convert them to factor levels.
+
+For part two the stock price:
+```{r fig.cap = "Time Series Plots of Quantitative Variables for Identifier 1031", out.width= "50%", fig.width = "50%", cache=TRUE, fig.align='center'}
+stock_price_1031<-strock_price_date%>%filter(identifier=="1031")
+
+price <- ts(stock_price_1031$price)
+shares_long <- ts(stock_price_1031$shares_long)
+shares_short <- ts(stock_price_1031$shares_short)
+trading_vol <- ts(stock_price_1031$trading_vol)
+retrieved_at <- ts(stock_price_1031$retrieved_at)
+
+p1<-ts_ggplot(price)+labs(y="Value",x="Price", start = c(2020,1,1))
+p2<-ts_ggplot(shares_long)+labs(y="Value",x="Shares Long", start = c(2020,1,1))
+p3<-ts_ggplot(shares_short)+labs(y="Value",x="Shares Short", start = c(2020,1,1))
+
+p4<-ts_ggplot(trading_vol)+labs(y="Value",x="Trading Vol", start = c(2020,1,1))
+#p4<-ts_ggplot(as.Date(retrieved_at))+labs(y="Value",x="Retrieved at Date", start = c(2020,1,1))
+
+(p1+p2)/(p3+p4)
+```
+
+### 6.5 VAR: Model Assumptions, Sensitivity Analysis & Validation
+
+#### 6.5.1 Model Assumptions 
+
+##### 6.5.1.1 Stationary Principle
+
+In the same token as ARIMA, since VAR is essentially a generalization of ARIMA in the multivariate case, we would also like to assess whether the variables under study are stationary. We use the Philips Perron test to assess the stationary principle, which finds that the response variable (daily domestic gross box office) along with all the predictor variables of interest above (daily theater count, wildest release, and runtime in minutes) having p values of 0.01, 0.05, 0.018 and 0.01 respectively. Therefore, we reject the null hypothesis which suggests that the data is stationary.
+
+```{r eval = FALSE}
+pp.test(daily_domestic_gross)
+pp.test(daily_theater_count)
+pp.test(widest_release_num)
+pp.test(runtime_minutes)
+```
+```{r eval = FALSE}
+pp.test(price)
+pp.test(shares_long)
+pp.test(shares_short)
+pp.test(trading_vol)
+```
+
+#### 6.5.2 Preliminary Results & Validation
+
+We fit a preliminary model using the daily theater count, widest release and daily domestic gross box office which obtained an adjusted $R^2$ value of 0.93. After this, we will select the optimal lag order behind the VAR we will be using, which is 8 from the model output. Lastly, we will run diagnostics tests for autocorrelation, heteroscedasticity, normality and stability. By the same token, we plan to fit the VAR model for stock price using the number of shares long, the number of shares short and the trading volumne as predictors. Splitting past data into training set to create a pseudo future dataset from the dataset given, we plan to examine performance on future data via cross validation.
+
+```{r eval = FALSE}
+v1 <- cbind(daily_domestic_gross, daily_theater_count, widest_release_num)
+lagselect <- VARselect(v1, lag.max = 15, type = "const")
+lagselect$selection
+
+Model1 <- VAR(v1, p = 8, type = "const", season = NULL, exog = NULL) 
+summary(Model1)
+```
+
+
+```{r eval = FALSE}
+v2 <- cbind(price, shares_long, shares_short, trading_vol)
+lagselect <- VARselect(v1, lag.max = 15, type = "const")
+lagselect$selection
+
+Model2 <- VAR(v2, p = 8, type = "const", season = NULL, exog = NULL) 
+summary(Model2)
+```
+#### 6.5.4 Diagnostics
+
+#### 6.5.4.1 Non-autocorrelated Residuals
+
+We first assess whether our model meets the assumption that the residuals should be non-autocorrelated, based on our assumption that the residuals are white noise and thus uncorrelated with the previous periods. We run the Breusch-Godfrey test for serially correlated errors to obtain a p value of 0.01, therefore see that the residuals do not show signs of autocorrelation. However, in case that is a chance that if we change the maximum lag order, there could be a sign of autocorrelation. Therefore, this study aims to experiment with multiple lag orders which we will confirm through sensitivity analysis.
+
+```{r, eval= FALSE}
+Serial1 <- serial.test(Model1, lags.pt = 5, type = "PT.asymptotic")
+```
+
+#### 6.5.4.2 ARCH Effects: Heteroscedasticity
+
+Another aspect to consider is the presence of heteroscedasticity, essentially clustered volatility areas in a time series dataset known as ARCH effects, which is common is time series data such as stock prices where massive rises or declines could be seen [@VAR]. Through the ARCH test, we obtain a p value of less than $2.2e^{-16}$ under degrees of freedom of 540, which signifies no degree of heteroscedasticity as we reject the null hypothesis. 
+
+```{r eval = FALSE}
+Arch1 <- arch.test(Model1, lags.multi = 15, multivariate.only = TRUE)
+Arch1
+```
+#### 6.5.4.3 Normality
+
+The VAR normality test has three components: the Jarque-Bera test, the Kurtosis test, and the Skewness test. All of the three tests give us a p value of less than $2.2e^{-16}$. Therefore, based on all the three results, it appears that the residuals of this particular model are normally distributed.
+
+```{r eval = FALSE}
+Norm1 <- normality.test(Model1, multivariate.only = TRUE)
+Norm1
+```
+
+#### 6.5.4.4 Stability
+
+Finally, we perform the stability test through the CUSUM test which assesses the stability of the covariates in the time series VAR model via a plot of the sum of recursive residuals [@VAR]. The diagnostic plot indicates structural breaks if at any point in the graph, the sum goes out of the red critical bounds. As we can see from the diagnostic plot below, while neither daily theater count nor widest release presents a structural break, the daily domestic gross box office slightly exceeds the critical bounds.
+
+```{r fig.cap = "CUCUM Test for VAR Model", out.width= "50%", out.width = "60%", cache=TRUE, fig.align='center'}
+Stability1 <- stability(Model1, type = "OLS-CUSUM")
+plot(Stability1)
+```
+
+
+#### 6.5.5 Sensitivity Analysis: Lag Structure
+
+Apart from the aforementioned multiple lag orders, this study also aims to perform sensitivity analysis by varying the lag structure in the VAR model. According to previous study [@lag-structure] which examines the effect of lag structure on forecasting accuracy, the forecasting accuracy of the VAR model varies dramatically across simple ad hoc rules, versus statistical criteria such as mean square error and Bayesian rules. This study aims to explore various lag structures such as Bayesian rules and MSE to perform sensitivity analysis.
+
+
+## 7. Predictability between Two Time Series: CCF
+
+Given the relationship between two time series, we decide to use the cross correlation function (CCF) model to identify lags of the fluctuations in HSX stock prices that might be useful predictors of movie box office. Since the CCF model gives us informative information on the order of prediction between movie box office and HSX stock prices through the set of sample correlations, we can also identify which variable is leading and which is lagging. We can perform similar model assumption checks for stationary principle, as well as cross validation through creation of a pseudo training future dataset, as well as aim to perform sensitivity analysis through varying the width of the moving average window.
+
+
+\newpage 
+
+## 8. Citations
